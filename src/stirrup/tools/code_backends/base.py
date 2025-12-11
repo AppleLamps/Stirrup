@@ -90,6 +90,34 @@ class UploadFilesResult:
     failed: dict[str, str] = field(default_factory=dict)  # source_path -> error message
 
 
+class PathValidator:
+    """Reusable path validation helpers for execution environments."""
+
+    @staticmethod
+    def ensure_no_escape(path: str) -> None:
+        """Reject obvious escape sequences that attempt to escape the sandbox."""
+        for pattern in (r"\.\.(/|\\)", r"~(/|\\)"):
+            if re.search(pattern, path):
+                raise ValueError(f"Path contains escape sequence: {path}")
+
+    @staticmethod
+    def validate_within_directory(
+        path: str | Path,
+        base_dir: Path,
+        *,
+        context_name: str = "execution environment",
+    ) -> Path:
+        """Resolve path and ensure it stays within base_dir."""
+        resolved = Path(path)
+        if not resolved.is_absolute():
+            resolved = base_dir / resolved
+        try:
+            resolved.resolve().relative_to(base_dir.resolve())
+        except ValueError as e:
+            raise ValueError(f"Path is outside {context_name}: {path}") from e
+        return resolved
+
+
 def format_result(result: CommandResult) -> ToolResult[ToolUseCountMetadata]:
     """Format a CommandResult as XML ToolResult (shared by all backends)."""
     if result.error_kind:

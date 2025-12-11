@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from itertools import chain, takewhile
 from pathlib import Path
 from types import TracebackType
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Literal, Self
 
 import anyio
 from pydantic import BaseModel, Field, ValidationError
@@ -41,8 +41,7 @@ from stirrup.tools.code_backends.base import CodeExecToolProvider
 from stirrup.tools.code_backends.local import LocalCodeExecToolProvider
 from stirrup.tools.finish import SIMPLE_FINISH_TOOL
 from stirrup.utils.logging import AgentLogger, AgentLoggerBase
-
-_PARENT_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar("parent_depth", default=0)
+from stirrup.core.exceptions import ContextOverflowError
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +69,10 @@ class SessionState:
     parent_exec_env: CodeExecToolProvider | None = None
     depth: int = 0
     uploaded_file_paths: list[str] = field(default_factory=list)  # Paths of files uploaded to exec_env
+
+    def __post_init__(self) -> None:
+        if self.depth < 0:
+            raise ValueError("Session depth cannot be negative")
 
 
 _SESSION_STATE: contextvars.ContextVar[SessionState] = contextvars.ContextVar("session_state")
@@ -121,6 +124,87 @@ def _get_total_token_usage(messages: list[list[ChatMessage]]) -> TokenUsage:
         [msg.token_usage for msg in chain.from_iterable(messages) if isinstance(msg, AssistantMessage)],
         start=TokenUsage(),
     )
+
+
+class _ContextEstimator:
+    """Lightweight token estimator for messages and tool definitions."""
+
+    def __init__(self, client: LLMClient, *, response_buffer_tokens: int = 500, per_message_overhead: int = 4) -> None:
+        self._client = client
+        self._encoding: Any = None
+        self._response_buffer_tokens = response_buffer_tokens
+        self._per_message_overhead = per_message_overhead
+
+    def _encoding_for_model(self) -> Any:
+        """Lazily load tiktoken encoding; fallback to None on failure."""
+        if self._encoding is not None:
+            return self._encoding
+        try:
+            import tiktoken  # type: ignore
+
+            model_name = self._client.model_slug.split("/")[-1]
+            self._encoding = tiktoken.encoding_for_model(model_name)
+        except Exception:
+            self._encoding = False
+        return self._encoding
+
+    def _estimate_text_tokens(self, text: str) -> int:
+        """Estimate tokens for raw text."""
+        enc = self._encoding_for_model()
+        if enc:
+            try:
+                return len(enc.encode(text))
+            except Exception:
+                pass
+        return max(1, len(text) // 4)
+
+    def _estimate_content_tokens(self, content: Any) -> int:
+        """Estimate tokens for a ChatMessage content field."""
+        if isinstance(content, str):
+            return self._estimate_text_tokens(content)
+        if isinstance(content, list):
+            total = 0
+            for block in content:
+                if isinstance(block, str):
+                    total += self._estimate_text_tokens(block)
+                elif isinstance(block, ImageContentBlock):
+                    # Rough allowance for image payloads
+                    total += 256
+                else:
+                    total += self._estimate_text_tokens(str(block))
+            return total
+        return self._estimate_text_tokens(str(content))
+
+    def estimate_messages_tokens(self, messages: list[ChatMessage], tools: dict[str, Tool] | None = None) -> int:
+        """Estimate total tokens for messages plus tool definitions and a response buffer."""
+        total = 0
+
+        for msg in messages:
+            total += self._per_message_overhead
+            total += self._estimate_content_tokens(msg.content)
+
+        if tools:
+            try:
+                tool_payload = {
+                    name: {
+                        "description": tool.description,
+                        "parameters": tool.parameters.model_json_schema() if tool.parameters else {},
+                    }
+                    for name, tool in tools.items()
+                }
+                tools_json = json.dumps(tool_payload)
+                total += self._estimate_text_tokens(tools_json)
+            except Exception:
+                # Best-effort estimation; skip tool payload on failure
+                pass
+
+        total += self._response_buffer_tokens
+        return total
+
+    def context_usage_pct(self, messages: list[ChatMessage], tools: dict[str, Tool] | None = None) -> float:
+        """Estimate percent of context window used."""
+        used = self.estimate_messages_tokens(messages, tools)
+        return min(1.0, used / max(1, self._client.max_tokens))
 
 
 class SubAgentParams(BaseModel):
@@ -228,6 +312,7 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
         self._last_finish_params: Any = None  # FinishParams type parameter
         self._last_run_metadata: dict[str, list[Any]] = {}
         self._transferred_paths: list[str] = []  # Paths transferred to parent (for subagents)
+        self._context_estimator = _ContextEstimator(client)
 
     @property
     def name(self) -> str:
@@ -248,6 +333,21 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
     def finish_tool(self) -> Tool:
         """The finish tool used to signal task completion."""
         return self._finish_tool
+
+    def _register_tool(self, tool: Tool) -> None:
+        """Register a tool ensuring unique names and protecting the finish tool."""
+        if tool.name in self._active_tools:
+            existing = self._active_tools[tool.name]
+            if tool.name == FINISH_TOOL_NAME:
+                raise ValueError(
+                    "Cannot override the finish tool. Use the finish_tool parameter in Agent.__init__.",
+                )
+            raise ValueError(
+                f"Tool '{tool.name}' already registered. "
+                f"Tool names must be unique. Existing: {type(existing).__name__}, New: {type(tool).__name__}",
+            )
+
+        self._active_tools[tool.name] = tool
 
     @property
     def logger(self) -> AgentLoggerBase:
@@ -489,10 +589,11 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
         exit_stack = AsyncExitStack()
         await exit_stack.__aenter__()
 
-        # Get parent state if exists (for subagent file transfer)
+        # Get parent state if exists (for subagent file transfer and depth tracking)
         parent_state = _SESSION_STATE.get(None)
 
-        current_depth = _PARENT_DEPTH.get()
+        # Derive depth from parent session (single source of truth)
+        current_depth = parent_state.depth + 1 if parent_state else 0
 
         # Create session state and store in ContextVar
         state = SessionState(
@@ -543,9 +644,11 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                     # Static Tool, use directly
                     active_tools.append(tool)
 
-            # Build active tools dict with finish tool (stored on instance, not session)
-            self._active_tools = {FINISH_TOOL_NAME: self._finish_tool}
-            self._active_tools.update({t.name: t for t in active_tools})
+            # Build active tools dict with validation (finish tool is protected)
+            self._active_tools = {}
+            self._register_tool(self._finish_tool)
+            for tool in active_tools:
+                self._register_tool(tool)
 
             # Validate subagent code exec requirements (only at root level)
             if current_depth == 0:
@@ -581,18 +684,28 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                     "[%s __aenter__] Upload result: uploaded=%s, failed=%s", self._name, result.uploaded, result.failed
                 )
 
-                # Store uploaded paths for system prompt
-                state.uploaded_file_paths = [uf.dest_path for uf in result.uploaded]
+                # Store uploaded paths for system prompt (even on partial success)
+                uploaded_paths = [uf.dest_path for uf in result.uploaded]
+                state.uploaded_file_paths = uploaded_paths
 
                 if result.failed:
-                    raise RuntimeError(f"Failed to upload files: {result.failed}")
+                    summary = (
+                        f"File upload encountered failures. "
+                        f"Successful: {len(uploaded_paths)} ({uploaded_paths}), "
+                        f"Failed: {len(result.failed)} ({result.failed})"
+                    )
+                    self._logger.warning(summary)
+                    raise RuntimeError(summary)
+
+                if not uploaded_paths:
+                    self._logger.warning("No files were uploaded.")
             self._pending_input_files = None  # Clear pending state
 
             # Configure and enter logger context
             self._logger.name = self._name
             self._logger.model = self._client.model_slug
             self._logger.max_turns = self._max_turns
-            # depth is already set (0 for main agent, passed in for sub-agents)
+            self._logger.depth = state.depth
             self._logger.__enter__()
 
             return self
@@ -700,19 +813,14 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                     tool.parameters.model_validate_json(tool_call.arguments) if tool.parameters is not None else None
                 )
 
-                # Set parent depth for sub-agent tools to read
-                prev_depth = _PARENT_DEPTH.set(self._logger.depth)
-                try:
-                    if inspect.iscoroutinefunction(tool.executor):
-                        result = await tool.executor(params)  # ty: ignore[invalid-await]
-                    elif self._run_sync_in_thread:
-                        # ty: ignore - type checker doesn't understand iscoroutinefunction narrowing
-                        result = await anyio.to_thread.run_sync(tool.executor, params)  # ty: ignore[unresolved-attribute]
-                    else:
-                        # ty: ignore - iscoroutinefunction check above ensures this is sync
-                        result = tool.executor(params)  # ty: ignore[invalid-assignment]
-                finally:
-                    _PARENT_DEPTH.reset(prev_depth)
+                if inspect.iscoroutinefunction(tool.executor):
+                    result = await tool.executor(params)  # ty: ignore[invalid-await]
+                elif self._run_sync_in_thread:
+                    # ty: ignore - type checker doesn't understand iscoroutinefunction narrowing
+                    result = await anyio.to_thread.run_sync(tool.executor, params)  # ty: ignore[unresolved-attribute]
+                else:
+                    # ty: ignore - iscoroutinefunction check above ensures this is sync
+                    result = tool.executor(params)  # ty: ignore[invalid-assignment]
 
                 # Store metadata if present
                 if result.metadata is not None:
@@ -724,6 +832,10 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                     tool_call.arguments,
                 )
                 result = ToolResult(content="Tool arguments are not valid")
+                args_valid = False
+            except Exception as e:  # pragma: no cover - defensive catch
+                LOGGER.error("Tool %s execution failed: %s", tool_call.name, e)
+                result = ToolResult(content=f"Tool execution failed: {e!s}")
                 args_valid = False
         else:
             LOGGER.debug(f"LLMClient tried to use the tool {tool_call.name} which is not in the tools list")
@@ -783,26 +895,66 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
         """Condense message history using LLM to stay within context window."""
         task_context: list[ChatMessage] = list(takewhile(lambda m: not isinstance(m, AssistantMessage), messages))
 
-        summary_prompt = [*messages, UserMessage(content=MESSAGE_SUMMARIZER)]
+        def _fallback_truncate(keep_tail: int = 30) -> list[ChatMessage]:
+            tail_source = messages[len(task_context) :]
+            tail = tail_source[-keep_tail:] if keep_tail > 0 else []
+            return [*task_context, *tail]
 
-        # We need to pass the tools to the client so that it has context of tools used in the conversation
-        summary = await self._client.generate(summary_prompt, self._active_tools)
+        summary_prompt = [*messages, UserMessage(content=MESSAGE_SUMMARIZER)]
+        try:
+            prompt_tokens = self._context_estimator.estimate_messages_tokens(summary_prompt, self._active_tools)
+            if prompt_tokens >= self._client.max_tokens * 0.9:
+                self._logger.warning(
+                    "Summary prompt estimated to use %d tokens (>=90%% of max); using truncation fallback",
+                    prompt_tokens,
+                )
+                return _fallback_truncate(keep_tail=20)
+        except Exception:
+            # Estimation failures should not block summarization; proceed best-effort
+            pass
+
+        try:
+            # We need to pass the tools to the client so that it has context of tools used in the conversation
+            summary = await self._client.generate(summary_prompt, self._active_tools)
+        except Exception as e:
+            self._logger.error("Context summarization failed: %s", e)
+            self._logger.warning("Using truncation fallback for summarization")
+            return _fallback_truncate()
 
         summary_bridge_prompt = MESSAGE_SUMMARIZER_BRIDGE_TEMPLATE.format(summary=summary.content)
         summary_bridge = UserMessage(content=summary_bridge_prompt)
         acknowledgement_msg = UserMessage(content="Got it, thanks!")
+        summarized_messages = [*task_context, summary_bridge, acknowledgement_msg]
+
+        try:
+            original_tokens = self._context_estimator.estimate_messages_tokens(messages, self._active_tools)
+            summarized_tokens = self._context_estimator.estimate_messages_tokens(
+                summarized_messages,
+                self._active_tools,
+            )
+            if summarized_tokens >= original_tokens * 0.9:
+                self._logger.warning(
+                    "Summarization ineffective (old=%d, new=%d); using truncation fallback",
+                    original_tokens,
+                    summarized_tokens,
+                )
+                return _fallback_truncate(keep_tail=20)
+        except Exception:
+            # If estimation fails, still return the summarized messages
+            pass
 
         # Log the completed summary
         summary_content = summary.content if isinstance(summary.content, str) else str(summary.content)
         self._logger.context_summarization_complete(summary_content, summary_bridge_prompt)
 
-        return [*task_context, summary_bridge, acknowledgement_msg]
+        return summarized_messages
 
     async def run(
         self,
         init_msgs: str | list[ChatMessage],
         *,
         depth: int | None = None,
+        on_error: Literal["raise", "continue", "save"] = "raise",
     ) -> tuple[FinishParams | None, list[list[ChatMessage]], dict[str, list[Any]]]:
         """Execute the agent loop until finish tool is called or max_turns reached.
 
@@ -815,6 +967,10 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
             init_msgs: Either a string prompt (converted to UserMessage) or a list of
                       ChatMessage to extend the conversation after the system prompt.
             depth: Logging depth for sub-agent runs. If provided, updates logger.depth for this run.
+            on_error: Error handling policy:
+                - "raise": propagate errors (default).
+                - "continue": log, message the user, and continue to next turn.
+                - "save": persist intermediate state to *_last_* fields, then re-raise.
 
         Returns:
             Tuple of (finish params, message history, run metadata).
@@ -877,13 +1033,39 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                 msgs.append(num_turns_remaining_msg)
                 self._logger.user_message(num_turns_remaining_msg)
 
-            # Pass turn info to step() for real-time logging
-            assistant_message, tool_messages, finish_call = await self.step(
-                msgs,
-                run_metadata,
-                turn=i + 1,
-                max_turns=self._max_turns,
-            )
+            try:
+                # Pass turn info to step() for real-time logging
+                assistant_message, tool_messages, finish_call = await self.step(
+                    msgs,
+                    run_metadata,
+                    turn=i + 1,
+                    max_turns=self._max_turns,
+                )
+            except ContextOverflowError:
+                # Propagate context window overflow – cannot recover safely
+                raise
+            except Exception as e:  # pragma: no cover - defensive catch
+                if on_error == "raise":
+                    raise
+                if on_error == "continue":
+                    error_msg = UserMessage(
+                        content=(
+                            f"An error occurred during execution: {e!s}\n"
+                            "Please try a different approach or call finish if you cannot continue."
+                        ),
+                    )
+                    msgs.append(error_msg)
+                    self._logger.error("Step %d failed, continuing: %s", i + 1, e)
+                    continue
+                if on_error == "save":
+                    full_msg_history.append(msgs)
+                    self._last_finish_params = finish_params
+                    self._last_run_metadata = run_metadata
+                    raise RuntimeError(
+                        f"Agent failed at turn {i + 1}. Intermediate results saved.",
+                    ) from e
+                # Should never reach here; fallback to raise
+                raise
 
             # Update cumulative stats
             total_tool_calls += len(tool_messages)
@@ -917,7 +1099,7 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                     )
                     # continue until the finish tool call is valid
 
-            pct_context_used = assistant_message.token_usage.total / self._client.max_tokens
+            pct_context_used = self._context_estimator.context_usage_pct(msgs, self._active_tools)
             if pct_context_used >= self._context_summarization_cutoff and i + 1 != self._max_turns:
                 self._logger.context_summarization_start(pct_context_used, self._context_summarization_cutoff)
                 full_msg_history.append(msgs)
@@ -969,16 +1151,16 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
             2. Proper ToolProvider lifecycle - sub-agent's ToolProviders are initialized
             3. Correct logging - logger context is entered for proper output formatting
             """
-            # Get parent's depth and calculate subagent depth
-            parent_depth = _PARENT_DEPTH.get()
-            sub_agent_depth = parent_depth + 1
-
             # Save parent's session state so we can restore it after subagent completes
             # This ensures sibling subagents see the parent's state, not a previous sibling's stale state
             parent_session_state = _SESSION_STATE.get(None)
+            parent_depth = parent_session_state.depth if parent_session_state else 0
+            sub_agent_depth = parent_depth + 1
             logger.debug(
-                "[%s] PRE-SESSION: _SESSION_STATE=%s, exec_env=%s, exec_env._temp_dir=%s",
+                "[%s] PRE-SESSION (depth %d -> %d): _SESSION_STATE=%s, exec_env=%s, exec_env._temp_dir=%s",
                 agent.name,
+                parent_depth,
+                sub_agent_depth,
                 id(parent_session_state) if parent_session_state else None,
                 type(parent_session_state.exec_env).__name__
                 if parent_session_state and parent_session_state.exec_env
@@ -988,9 +1170,6 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                 else None,
             )
 
-            # Set _PARENT_DEPTH to subagent's depth BEFORE entering session
-            # so that __aenter__ reads the correct depth for SessionState.depth
-            prev_depth = _PARENT_DEPTH.set(sub_agent_depth)
             try:
                 init_msgs: list[ChatMessage] = []
                 if system_prompt:
@@ -1004,9 +1183,6 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                     output_dir=".",  # Path in parent's exec env
                     input_files=list(params.input_files) if params.input_files else None,  # ty: ignore[invalid-argument-type]
                 ) as agent_session:
-                    # Override logger depth for proper indentation in console output
-                    agent_session._logger.depth = sub_agent_depth  # noqa: SLF001
-
                     finish_params, msg_history, run_metadata = await agent_session.run(init_msgs)
 
                     # Extract the last assistant message with actual content (not just tool calls)
@@ -1083,8 +1259,6 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                     else None,
                 )
 
-                # Restore parent's depth
-                _PARENT_DEPTH.reset(prev_depth)
                 # Restore parent's session state so next sibling subagent sees it
                 if parent_session_state is not None:
                     _SESSION_STATE.set(parent_session_state)

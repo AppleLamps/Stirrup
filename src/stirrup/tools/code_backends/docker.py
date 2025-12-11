@@ -32,6 +32,7 @@ from .base import (
     CodeExecToolProvider,
     CodeExecutionParams,
     CommandResult,
+    PathValidator,
     SavedFile,
     SaveOutputFilesResult,
     UploadedFile,
@@ -143,6 +144,7 @@ class DockerCodeExecToolProvider(CodeExecToolProvider):
         if self._temp_dir is None:
             raise RuntimeError("ExecutionEnvironment not started. Use 'async with exec_env.create()' first.")
 
+        PathValidator.ensure_no_escape(path)
         file_path = Path(path)
 
         # Handle both absolute container paths and relative paths
@@ -157,11 +159,11 @@ class DockerCodeExecToolProvider(CodeExecToolProvider):
         else:
             file_path = self._temp_dir / file_path
 
-        # Security check: ensure path is within temp directory
-        try:
-            file_path.resolve().relative_to(self._temp_dir.resolve())
-        except ValueError:
-            raise ValueError(f"Path is outside execution environment directory: {path}") from None
+        file_path = PathValidator.validate_within_directory(
+            file_path,
+            self._temp_dir,
+            context_name="execution environment directory",
+        )
 
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {path}")
@@ -424,6 +426,7 @@ class DockerCodeExecToolProvider(CodeExecToolProvider):
         if self._temp_dir is None:
             raise RuntimeError("ExecutionEnvironment not started.")
 
+        PathValidator.ensure_no_escape(str(path))
         source_path = Path(path)
 
         # Handle both absolute container paths and relative paths
@@ -438,11 +441,11 @@ class DockerCodeExecToolProvider(CodeExecToolProvider):
         else:
             host_path = self._temp_dir / source_path
 
-        # Security: ensure path is within temp directory
-        try:
-            host_path.resolve().relative_to(self._temp_dir.resolve())
-        except ValueError as e:
-            raise ValueError(f"Path is outside execution environment: {path}") from e
+        host_path = PathValidator.validate_within_directory(
+            host_path,
+            self._temp_dir,
+            context_name="execution environment",
+        )
 
         return host_path
 

@@ -16,6 +16,7 @@ from .base import (
     CodeExecToolProvider,
     CodeExecutionParams,
     CommandResult,
+    PathValidator,
     SavedFile,
     SaveOutputFilesResult,
     UploadedFile,
@@ -157,16 +158,8 @@ class LocalCodeExecToolProvider(CodeExecToolProvider):
         if self._temp_dir is None:
             raise RuntimeError("ExecutionEnvironment not started.")
 
-        resolved = Path(path)
-        if not resolved.is_absolute():
-            resolved = self._temp_dir / resolved
-
-        # Security: ensure path is within temp directory
-        try:
-            resolved.resolve().relative_to(self._temp_dir.resolve())
-        except ValueError as e:
-            raise ValueError(f"Path is outside execution environment: {path}") from e
-
+        PathValidator.ensure_no_escape(path)
+        resolved = PathValidator.validate_within_directory(path, self._temp_dir, context_name="execution environment")
         return resolved
 
     async def read_file_bytes(self, path: str) -> bytes:
@@ -332,17 +325,11 @@ class LocalCodeExecToolProvider(CodeExecToolProvider):
 
         for source_path_str in paths:
             try:
-                source_path = Path(source_path_str)
-                if not source_path.is_absolute():
-                    source_path = self._temp_dir / source_path
-
-                # Security: ensure path is within temp directory
-                try:
-                    source_path.resolve().relative_to(self._temp_dir.resolve())
-                except ValueError:
-                    result.failed[source_path_str] = "Path is outside execution environment directory"
-                    logger.warning("Attempted to access path outside execution environment: %s", source_path_str)
-                    continue
+                source_path = PathValidator.validate_within_directory(
+                    source_path_str,
+                    self._temp_dir,
+                    context_name="execution environment directory",
+                )
 
                 if not source_path.exists():
                     result.failed[source_path_str] = "File does not exist"
